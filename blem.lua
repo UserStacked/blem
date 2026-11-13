@@ -239,6 +239,29 @@ end
 
 local NEGATIONS = { ["not"] = true, ["no"] = true, ["hindi"] = true, ["di"] = true, ["never"] = true, ["without"] = true, ["un"] = true }
 
+-- A phrase from `words` used in the negative ("not confirmed", "hindi received"). Returns true, phrase.
+function Util.hasNegatedWord(text, words)
+	local t = string.lower(tostring(text or ""))
+	for _, w in ipairs(words) do
+		if w ~= "" then
+			local pattern = "%f[%w]" .. string.gsub(w, "[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0") .. "%f[%W]"
+			local init = 1
+			while true do
+				local s, e = string.find(t, pattern, init)
+				if not s then
+					break
+				end
+				local before = string.match(string.sub(t, 1, s - 1), "(%w+)%W*$")
+				if before and NEGATIONS[before] then
+					return true, before .. " " .. w
+				end
+				init = e + 1
+			end
+		end
+	end
+	return false, nil
+end
+
 -- Whole-word/phrase match that ignores negated uses: "verified" matches "Payment verified" but not
 -- "unverified" or "not verified". Returns true and the phrase.
 function Util.hasWord(text, words)
@@ -595,16 +618,18 @@ local DEFAULTS = {
 	shortcutEnabled = false,
 	-- Cashier Automation
 	cashierEnabled = false,
+	cashierRingUp = true,
+	utangFirst = true,
 	payCash = true,
 	payKashG = true,
 	utangAccept = false,
 	utangDecline = false,
-	kashgPolicy = "Verified only",
-	kashgDeclineInvalid = false,
+	kashgPolicy = "Accept unless fake",
+	kashgDeclineInvalid = true,
 	requireCustomer = true,
 	customerRadius = 16,
 	successWords = "success,successful,paid,payment received,received,sent,completed,confirmed,verified,approved",
-	failWords = "failed,insufficient,declined,fake,invalid,error,pending,expired,scam,kulang,not enough,unverified,unpaid,not received,not paid,cancelled",
+	failWords = "failed,insufficient,declined,fake,peke,edited,tampered,fraud,invalid,error,pending,expired,scam,kulang,not enough,mismatch,wrong amount,hindi tugma,unverified,unpaid,not received,not paid,cancelled",
 	-- Auto Stack
 	stackEnabled = false,
 	stackThreshold = 50,
@@ -628,7 +653,7 @@ local DEFAULTS = {
 	thiefRounds = 3,
 	thiefReturn = true,
 	thiefRadius = 120,
-	thiefRange = 6,
+	thiefRange = 4,
 	thiefWords = "thief,magnanakaw,shoplifter,snatcher,robber,kawatan,holdaper",
 	-- Ice Cream & Taho
 	bonusReapply = false,
@@ -639,9 +664,10 @@ local DEFAULTS = {
 	cleanOutdoor = true,
 	-- Settings
 	movement = "Walk",
+	speed = "Fast",
 	actionDelay = 0.3,
 	clickMethod = "Auto",
-	settingsVersion = 2,
+	settingsVersion = 3,
 	manualOverride = true,
 	overrideSeconds = 4,
 	toggleKey = "RightShift",
@@ -681,23 +707,37 @@ end
 
 local function loadConfig()
 	local content = Env.read(CONFIG_PATH)
+	local savedVersion = nil
 	if content and HttpService then
 		local ok, data = pcall(function()
 			return HttpService:JSONDecode(content)
 		end)
 		if ok and type(data) == "table" then
 			Cfg = Util.merge(DEFAULTS, data)
+			savedVersion = tonumber(data.settingsVersion) or 1
 		end
+	end
+	if savedVersion then
+		Cfg.settingsVersion = savedVersion
 	end
 	for k in pairs(ENABLE_KEYS) do
 		Cfg[k] = false
 	end
 	-- Plot names are handed out per server, so a plot picked last time may belong to someone else now.
 	Cfg.plotChoice = "Auto"
-	-- Older settings files kept the shorter failure-word list; add the negated words.
-	if (tonumber(Cfg.settingsVersion) or 1) < 2 then
+	-- Settings saved by older versions: bring in the new defaults.
+	local version = tonumber(Cfg.settingsVersion) or 1
+	if version < 3 then
 		Cfg.failWords = DEFAULTS.failWords
-		Cfg.settingsVersion = 2
+		Cfg.kashgPolicy = DEFAULTS.kashgPolicy
+		Cfg.kashgDeclineInvalid = DEFAULTS.kashgDeclineInvalid
+		if Cfg.thiefRange == 6 then
+			Cfg.thiefRange = DEFAULTS.thiefRange
+		end
+		Cfg.settingsVersion = 3
+	end
+	if Cfg.kashgPolicy == "Accept unless invalid" then
+		Cfg.kashgPolicy = "Accept unless fake"
 	end
 end
 
@@ -1525,6 +1565,7 @@ function Sched.sleep(token, seconds)
 end
 
 -- Waits until pred() returns a truthy value (returned) or the timeout passes (nil).
+-- In Fast speed it checks every frame instead of every 0.1 s.
 function Sched.waitFor(token, pred, timeout, step)
 	local deadline = os.clock() + (timeout or 5)
 	while true do
@@ -1536,7 +1577,7 @@ function Sched.waitFor(token, pred, timeout, step)
 		if os.clock() >= deadline then
 			return nil
 		end
-		task.wait(step or 0.1)
+		task.wait(step or (Cfg.speed == "Fast" and 0 or 0.1))
 	end
 end
 
@@ -2183,7 +2224,8 @@ local function onTop(button)
 	return true
 end
 
-local function vimClick(button)
+-- A real (virtual) left click at screen point x, y (full-window coordinates).
+local function vimClickAt(x, y)
 	local vim = Env.vim()
 	if not vim then
 		return false
@@ -2193,9 +2235,7 @@ local function vimClick(button)
 		task.wait()
 	end
 	Actions.mouseBusy = true
-	local inset = insetOf(button)
-	local pos = button.AbsolutePosition + button.AbsoluteSize / 2 + inset
-	local x, y = pos.X, pos.Y
+	local fast = Cfg.speed == "Fast"
 	if UIHooks.hideAt then
 		UIHooks.hideAt(x, y)
 	end
@@ -2203,17 +2243,25 @@ local function vimClick(button)
 		vim:SendMouseMoveEvent(x, y, game)
 		vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
 	end)
-	task.wait(0.05)
+	task.wait(fast and 0.02 or 0.05)
 	pcall(function()
 		vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
 	end)
 	task.wait() -- let the engine process the release before the menu comes back
-	task.wait()
+	if not fast then
+		task.wait()
+	end
 	if UIHooks.restore then
 		UIHooks.restore()
 	end
 	Actions.mouseBusy = false
 	return true
+end
+
+local function vimClick(button)
+	local inset = insetOf(button)
+	local pos = button.AbsolutePosition + button.AbsoluteSize / 2 + inset
+	return vimClickAt(pos.X, pos.Y)
 end
 
 local function pressable(button)
@@ -2246,7 +2294,8 @@ function Actions.click(token, button, opts)
 	if not Util.guiVisible(button) then
 		return false, "the button isn't on screen"
 	end
-	Sched.wait(token, Cfg.actionDelay)
+	-- Fast: a short pause only (some game windows ignore a click in the very first frame).
+	Sched.wait(token, Cfg.speed == "Fast" and 0.05 or Cfg.actionDelay)
 	if not Util.guiVisible(button) then
 		return false, "the button disappeared"
 	end
@@ -2382,6 +2431,89 @@ function Actions.useTool(token, tool, aimPos)
 	return (pcall(function()
 		tool:Activate()
 	end))
+end
+
+local CAM_CUSTOM = enumItem(Enum.CameraType, "Custom")
+local CAM_SCRIPTABLE = enumItem(Enum.CameraType, "Scriptable")
+
+-- Is a game button (or other clickable GUI) under this screen point? A world click there would
+-- press that button instead, so swings never click through the game's HUD.
+local function screenCovered(x, y)
+	local inset = Vector2.new(0, 0)
+	if GuiService then
+		local ok, i = pcall(function()
+			return GuiService:GetGuiInset()
+		end)
+		if ok and i then
+			inset = i
+		end
+	end
+	local ok, list = pcall(function()
+		return P.gui:GetGuiObjectsAtPosition(x - inset.X, y - inset.Y)
+	end)
+	if not ok or type(list) ~= "table" then
+		return false
+	end
+	for _, o in ipairs(list) do
+		if o:IsA("GuiButton") or o:IsA("TextBox") or o.Active then
+			return true
+		end
+	end
+	return false
+end
+
+--[[ Swings the held tool AT a target the way a player does: a real click on the target's spot on
+     screen (so the game sees the click, the mouse target and the tool activation together).
+     If the target is off screen, the camera is turned toward it for that one click and then
+     handed straight back (only when the camera is in its normal mode). method = "click" or
+     "activate" (Tool:Activate, used when there is no VirtualInputManager or as an alternative). ]]
+function Actions.swing(token, tool, targetPos, method)
+	Actions.face(targetPos)
+	local cam = Workspace.CurrentCamera
+	if method ~= "activate" and Env.vim() and cam and Cfg.clickMethod ~= "Game signals" then
+		local function project()
+			local ok, v, on = pcall(function()
+				local p, vis = cam:WorldToViewportPoint(targetPos)
+				return p, vis
+			end)
+			if ok and on and v.Z > 0 then
+				return v
+			end
+			return nil
+		end
+		local point = project()
+		local turned = false
+		if not point and CAM_CUSTOM and CAM_SCRIPTABLE and cam.CameraType == CAM_CUSTOM and P.root then
+			local ok = pcall(function()
+				local look = targetPos - P.root.Position
+				look = Vector3.new(look.X, 0, look.Z)
+				if look.Magnitude < 0.1 then
+					look = Vector3.new(0, 0, -1)
+				end
+				cam.CameraType = CAM_SCRIPTABLE
+				cam.CFrame = CFrame.new(P.root.Position - look.Unit * 8 + Vector3.new(0, 4, 0), targetPos)
+			end)
+			turned = ok
+			task.wait()
+			point = project()
+		end
+		local clicked = false
+		if point and not screenCovered(point.X, point.Y) then
+			clicked = vimClickAt(point.X, point.Y)
+		end
+		if turned and cam.CameraType == CAM_SCRIPTABLE then
+			pcall(function()
+				cam.CameraType = CAM_CUSTOM
+			end)
+		end
+		if clicked then
+			return true, "click"
+		end
+	end
+	local ok = pcall(function()
+		tool:Activate()
+	end)
+	return ok, "activate"
 end
 
 --==================================================================================
@@ -2827,7 +2959,10 @@ function Tx.handleCash(token, panel, mode, bills)
 				end
 				return countDescendants(panel) ~= beforeCount
 			end,
-			timeout = 1.2,
+			timeout = Cfg.speed == "Fast" and 0.6 or 1.2,
+			-- Pressed again only when nothing at all changed; a double press would show up in the
+			-- running total below and be undone.
+			retrySafe = true,
 		})
 		if not Util.guiVisible(bills) then
 			return "Failed", due, "the cashier window closed while counting"
@@ -2878,22 +3013,36 @@ function Tx.handleCash(token, panel, mode, bills)
 	return "Failed", due, why
 end
 
--- KASHG (the game's e-wallet, ≈ GCash): only accepted when the window shows a verified payment.
+-- KASHG (the game's e-wallet, ≈ GCash). A payment is fake when its window shows a failure word,
+-- a success word used in the negative ("not confirmed"), or a paid amount below the total.
+State.kashgSeen = State.kashgSeen or {}
 function Tx.handleKashG(token, panel, mode)
 	local text = GG.allText(panel)
-	if not Tx.seenKashG[text] then
-		Tx.seenKashG[text] = true
-		Log.debug("Cashier", "KashG window says: " .. string.sub(text, 1, 200))
-	end
 	-- Whole words only, and negated phrases ("not received", "unverified") never count as success.
+	local successWords = Util.keywords(Cfg.successWords)
 	local bad, badWord = Util.hasWord(text, Util.keywords(Cfg.failWords))
-	local good, goodWord = Util.hasWord(text, Util.keywords(Cfg.successWords))
+	local negated, negWord = Util.hasNegatedWord(text, successWords)
+	if negated and not bad then
+		bad, badWord = true, negWord
+	end
+	local good, goodWord = Util.hasWord(text, successWords)
 	local total = GG.labelled(panel, KEY_TOTAL)
 	local paid = GG.labelled(panel, { "paid", "sent", "amount", "received" }, nil, KEY_TOTAL)
 	local mismatch = total and paid and (paid + 0.01 < total)
-	local verdict = (bad or mismatch) and "invalid" or (good and "verified" or "unclear")
+	local verdict = (bad or mismatch) and "fake" or (good and "verified" or "unclear")
 	local amount = total or paid
 	State.transaction = { stage = "Checking KashG payment", kind = "KashG", amount = amount, since = os.clock() }
+	-- Record each new kind of KashG window once (shown in the log and the game scan) so the
+	-- fake/real wording can be tuned to what the game actually shows.
+	local shape = string.gsub(text, "%d+", "#")
+	if not Tx.seenKashG[shape] then
+		Tx.seenKashG[shape] = true
+		table.insert(State.kashgSeen, 1, { time = Util.clock(), text = string.sub(text, 1, 240), verdict = verdict })
+		while #State.kashgSeen > 15 do
+			table.remove(State.kashgSeen)
+		end
+		Log.info("Cashier", "KashG window (" .. verdict .. "): " .. string.sub(text, 1, 160))
+	end
 
 	local function press(names, texts, outcome, note)
 		local ok, why = confirmClose(token, panel, names, texts, "KashG")
@@ -2921,17 +3070,17 @@ function Tx.handleKashG(token, panel, mode)
 	if policy == "Manual review" then
 		return "Manual", amount, "KashG policy is 'Manual review'"
 	end
-	if verdict == "invalid" then
+	if verdict == "fake" then
 		if Cfg.kashgDeclineInvalid then
-			return press({ "Decline" }, { "decline", "reject" }, "Declined", "invalid: " .. reasonBad)
+			return press({ "Decline" }, { "decline", "reject" }, "Declined", "fake: " .. reasonBad)
 		end
-		return "Manual", amount, "the KashG payment doesn't look valid (" .. reasonBad .. ")"
+		return "Manual", amount, "the KashG payment looks fake (" .. reasonBad .. ")"
 	end
 	if verdict == "verified" then
 		return press({ "Accept" }, { "accept" }, "Completed", "verified: " .. goodWord)
 	end
-	if policy == "Accept unless invalid" then
-		return press({ "Accept" }, { "accept" }, "Completed", "no warning signs found")
+	if policy == "Accept unless fake" then
+		return press({ "Accept" }, { "accept" }, "Completed", "no sign of a fake")
 	end
 	return "Manual", amount, "couldn't confirm the KashG payment went through (no success text found)"
 end
@@ -3032,7 +3181,18 @@ end
 --==================================================================================
 local Cashier = { key = "cashier", title = "Cashier Automation", category = "Cashier" }
 
+-- Who is at the counter: the nearest customer model, or (without customer models) the current
+-- "register on" cycle. Used so each customer's utang is checked once, before their checkout.
+function Tx.customerKey(reg)
+	local near = NPC.near(Util.position(reg.prompt), Cfg.customerRadius)
+	if near[1] then
+		return near[1].model
+	end
+	return "cycle" .. tostring(Tx.regCycle or 0)
+end
+
 function Cashier.step(token)
+	local fast = Cfg.speed == "Fast"
 	if not (Cfg.payCash or Cfg.payKashG or Cfg.utangAccept or Cfg.utangDecline) then
 		State.set("cashier", "WAITING", "Turn on at least one payment method")
 		return 2
@@ -3040,7 +3200,7 @@ function Cashier.step(token)
 	local p = Tx.panels()
 	if Tx.manualPending(p) then
 		State.set("cashier", "WAITING", "Waiting for you to finish: " .. Tx.manual.reason)
-		return 1
+		return fast and 0.2 or 1
 	end
 	if Tx.anyPanel(p) then
 		State.set("cashier", "WORKING", "Handling an open transaction window")
@@ -3048,11 +3208,17 @@ function Cashier.step(token)
 		local ok = Sched.withBody(token, "cashier", 80, function(h)
 			h.preemptible = false
 			Tx.process(token, Tx.panels(), "auto")
-		end, 1.5, true)
+		end, fast and 0.3 or 1.5, true)
 		if not ok then
 			Tx.process(token, Tx.panels(), "auto")
 		end
-		return 0.3
+		return fast and 0.05 or 0.3
+	end
+	if not Cfg.cashierRingUp then
+		-- Assist mode: you press E at the register, the mod finishes the payment the moment it opens.
+		State.pending.customers = 0
+		State.set("cashier", "WATCHING", "Press E at the register; the payment is finished for you")
+		return fast and 0.05 or 0.25
 	end
 	local usable, why = Plot.usable()
 	if not usable then
@@ -3069,8 +3235,13 @@ function Cashier.step(token)
 		State.pending.customers = 0
 		State.set("cashier", "IDLE", "No customer at the register")
 		Tx.noCustomerSince = nil
-		return 1
+		if not Tx.regOff then
+			Tx.regOff = true
+			Tx.regCycle = (Tx.regCycle or 0) + 1
+		end
+		return fast and 0.2 or 1
 	end
+	Tx.regOff = false
 	local near = Tx.customersNear(reg)
 	State.pending.customers = near
 	if Cfg.requireCustomer and near == 0 then
@@ -3080,13 +3251,26 @@ function Cashier.step(token)
 			Log.info("Cashier", "The register prompt is on but no customer model is near it. If customers are waiting, turn off 'Require a customer nearby'.")
 		end
 		State.set("cashier", "IDLE", "No customer near the register")
-		return 1
+		return fast and 0.2 or 1
 	end
 	if os.clock() < Tx.backoffUntil then
 		return 0.5
 	end
 	State.set("cashier", "WORKING", "Ringing up a customer")
+	local customer = Tx.customerKey(reg)
 	local got, res = Sched.withBody(token, "cashier", 80, function(h)
+		-- A customer who owes you pays their utang first: check the Utang Book once per customer.
+		if Cfg.utangFirst and Tx.utangPass and customer ~= Tx.lastUtangCheck then
+			Tx.lastUtangCheck = customer
+			State.set("cashier", "WORKING", "Checking the Utang Book before this checkout")
+			local n, why = Tx.utangPass(token, "before checkout")
+			if why then
+				Log.warn("Cashier", "Utang check before checkout: " .. tostring(why))
+			elseif n and n > 0 then
+				Log.info("Cashier", "Collected " .. n .. " utang before ringing up the customer.")
+			end
+			State.set("cashier", "WORKING", "Ringing up a customer")
+		end
 		local ok, why = Actions.trigger(token, reg.prompt, {
 			verify = function()
 				return Tx.anyPanel()
@@ -3111,7 +3295,7 @@ function Cashier.step(token)
 	else
 		Tx.fails = 0
 	end
-	return 0.3
+	return fast and 0.05 or 0.3
 end
 
 function Cashier.onStop()
@@ -3582,7 +3766,7 @@ function Stack.step(token, manual)
 		end
 		Actions.unequip(token)
 	end, 20)
-	return 0.5
+	return Cfg.speed == "Fast" and 0.1 or 0.5 -- straight on to the next job in Fast speed
 end
 
 --==================================================================================
@@ -4006,6 +4190,108 @@ function Utang.summarize(rows)
 	State.pending.utang = collectable
 end
 
+-- One pass over the Utang Book: open it, collect every debt the game lets you collect
+-- (largest first), close it. The caller must hold the body lock. Returns the number collected.
+function Utang.pass(token, context)
+	local book = Plot.first("utangBook")
+	if not book then
+		return 0, "Utang Book not found on your plot"
+	end
+	Sched.defer(token, function()
+		local panel = bookPanel()
+		local close = panel and GG.findButton(panel, { "Close" }, { "close" })
+		if close then
+			Actions.rawClick(close)
+		end
+	end)
+	local wasOpen = bookPanel() ~= nil
+	if not wasOpen then
+		local ok, why = Actions.trigger(token, book.prompt, { verify = bookPanel, timeout = 4 })
+		if not ok then
+			return 0, "couldn't open the Utang Book: " .. tostring(why)
+		end
+	end
+	local panel = bookPanel()
+	local rows = Utang.readRows(panel)
+	Utang.summarize(rows)
+	local eligible = {}
+	for _, r in ipairs(rows) do
+		local key = r.name .. "|" .. tostring(r.amount)
+		if r.eligible and not (Utang.collected[key] and os.clock() - Utang.collected[key] < 90) then
+			r.key = key
+			eligible[#eligible + 1] = r
+		end
+	end
+	if Cfg.utangPriority == "Largest first" then
+		table.sort(eligible, function(a, b)
+			return (a.amount or 0) > (b.amount or 0)
+		end)
+	end
+	local count = 0
+	for _, r in ipairs(eligible) do
+		if not Util.alive(r.button) or not Util.guiVisible(r.button) then
+			break -- the list re-ordered; the next check picks up the rest
+		end
+		local moneyBefore = P.money()
+		local amountLabel = nil
+		for _, t in ipairs(GG.texts(r.row)) do
+			if not (t.obj == r.button or t.obj:IsDescendantOf(r.button)) and Util.parseMoney(t.text) == r.amount then
+				amountLabel = t.obj
+				break
+			end
+		end
+		-- Collected = the row went away, its amount went down, or your money went up.
+		-- A button that just changes to "Wait"/"Not yet" is a refusal, not a collection.
+		local function collected()
+			if not Util.alive(r.row) or not Util.guiVisible(r.row) then
+				return true
+			end
+			if amountLabel and Util.alive(amountLabel) then
+				local now = Util.parseMoney(amountLabel.Text)
+				if now and r.amount and now < r.amount then
+					return true
+				end
+			end
+			moneyCache.t = -100
+			local m = P.money()
+			return moneyBefore and m and m > moneyBefore
+		end
+		local ok = Actions.click(token, r.button, { verify = collected, timeout = 2.5 })
+		Utang.collected[r.key] = os.clock() -- never pressed twice for the same debt, even if unverified
+		if ok then
+			count = count + 1
+			State.utang.collected = State.utang.collected + 1
+			State.utang.collectedTotal = State.utang.collectedTotal + (r.amount or 0)
+			Log.success("Utang", "Collected " .. (r.amount and Util.formatMoney(r.amount) or "a debt") .. (r.name ~= "" and (" from " .. r.name) or "")
+				.. (context and (" (" .. context .. ")") or "") .. ".")
+			State.complete("utang")
+		else
+			Log.warn("Utang", "Collect" .. (r.name ~= "" and (" for " .. r.name) or "") .. " didn't go through (the customer may not be able to pay yet).")
+		end
+	end
+	if bookPanel() then
+		Utang.summarize(Utang.readRows(bookPanel()))
+	end
+	if #eligible == 0 and not context then
+		Log.info("Utang", "Utang Book checked: " .. (State.utang.count or 0) .. " debt(s), " .. Util.formatMoney(State.utang.total or 0) .. " outstanding, none collectable now.")
+	end
+	if not wasOpen and bookPanel() then
+		local close = GG.findButton(bookPanel(), { "Close" }, { "close" })
+		if close then
+			Actions.click(token, close, {
+				verify = function()
+					return bookPanel() == nil
+				end,
+				timeout = 2,
+				retrySafe = true,
+			})
+		end
+	end
+	return count
+end
+
+Tx.utangPass = Utang.pass -- used by the cashier to collect a customer's utang before checkout
+
 function Utang.step(token, manual)
 	if not manual and os.clock() - Utang.lastRun < Cfg.utangInterval then
 		State.set("utang", "IDLE", "Next check in " .. math.ceil(Cfg.utangInterval - (os.clock() - Utang.lastRun)) .. "s")
@@ -4020,105 +4306,22 @@ function Utang.step(token, manual)
 		State.set("utang", "WAITING", "Waiting for the current transaction to finish")
 		return 2
 	end
-	local book = Plot.first("utangBook")
-	if not book then
+	if not Plot.first("utangBook") then
 		State.set("utang", "UNAVAILABLE", "Utang Book not found on your plot")
 		return 10
 	end
 	Utang.lastRun = os.clock()
 	State.set("utang", "WORKING", "Checking the Utang Book")
 	Sched.withBody(token, "utang", 60, function()
-		Sched.defer(token, function()
-			local panel = bookPanel()
-			local close = panel and GG.findButton(panel, { "Close" }, { "close" })
-			if close then
-				Actions.rawClick(close)
-			end
-		end)
-		local wasOpen = bookPanel() ~= nil
-		if not wasOpen then
-			local ok, why = Actions.trigger(token, book.prompt, { verify = bookPanel, timeout = 4 })
-			if not ok then
-				Log.warn("Utang", "Couldn't open the Utang Book: " .. tostring(why))
-				return
-			end
-		end
-		local panel = bookPanel()
-		local rows = Utang.readRows(panel)
-		Utang.summarize(rows)
-		local eligible = {}
-		for _, r in ipairs(rows) do
-			local key = r.name .. "|" .. tostring(r.amount)
-			if r.eligible and not (Utang.collected[key] and os.clock() - Utang.collected[key] < 90) then
-				r.key = key
-				eligible[#eligible + 1] = r
-			end
-		end
-		if Cfg.utangPriority == "Largest first" then
-			table.sort(eligible, function(a, b)
-				return (a.amount or 0) > (b.amount or 0)
-			end)
-		end
-		for _, r in ipairs(eligible) do
-			if not Util.alive(r.button) or not Util.guiVisible(r.button) then
-				break -- the list re-ordered; the next check picks up the rest
-			end
-			local moneyBefore = P.money()
-			local amountLabel = nil
-			for _, t in ipairs(GG.texts(r.row)) do
-				if not (t.obj == r.button or t.obj:IsDescendantOf(r.button)) and Util.parseMoney(t.text) == r.amount then
-					amountLabel = t.obj
-					break
-				end
-			end
-			-- Collected = the row went away, its amount went down, or your money went up.
-			-- A button that just changes to "Wait"/"Not yet" is a refusal, not a collection.
-			local function collected()
-				if not Util.alive(r.row) or not Util.guiVisible(r.row) then
-					return true
-				end
-				if amountLabel and Util.alive(amountLabel) then
-					local now = Util.parseMoney(amountLabel.Text)
-					if now and r.amount and now < r.amount then
-						return true
-					end
-				end
-				moneyCache.t = -100
-				local m = P.money()
-				return moneyBefore and m and m > moneyBefore
-			end
-			local ok = Actions.click(token, r.button, { verify = collected, timeout = 2.5 })
-			Utang.collected[r.key] = os.clock() -- never pressed twice for the same debt, even if unverified
-			if ok then
-				State.utang.collected = State.utang.collected + 1
-				State.utang.collectedTotal = State.utang.collectedTotal + (r.amount or 0)
-				Log.success("Utang", "Collected " .. (r.amount and Util.formatMoney(r.amount) or "a debt") .. (r.name ~= "" and (" from " .. r.name) or "") .. ".")
-				State.complete("utang")
-			else
-				Log.warn("Utang", "Collect" .. (r.name ~= "" and (" for " .. r.name) or "") .. " didn't go through (the customer may not be able to pay yet).")
-			end
-		end
-		if bookPanel() then
-			Utang.summarize(Utang.readRows(bookPanel()))
-		end
-		if #eligible == 0 then
-			Log.info("Utang", "Utang Book checked: " .. (State.utang.count or 0) .. " debt(s), " .. Util.formatMoney(State.utang.total or 0) .. " outstanding, none collectable now.")
-		end
-		if not wasOpen and bookPanel() then
-			local close = GG.findButton(bookPanel(), { "Close" }, { "close" })
-			if close then
-				Actions.click(token, close, {
-					verify = function()
-						return bookPanel() == nil
-					end,
-					timeout = 2,
-				})
-			end
+		local _, why = Utang.pass(token)
+		if why then
+			Log.warn("Utang", why)
 		end
 	end, 20)
 	State.set("utang", "IDLE", "Last check " .. Util.clock())
 	return 2
 end
+
 
 --==================================================================================
 -- 19. FEATURE: NPC / THIEF MANAGEMENT (Tsinelas, 3 swings, verify, return)
@@ -4270,7 +4473,7 @@ function Thief.engage(token, t)
 			result = "couldn't take out the Tsinelas"
 			return
 		end
-		local swings = 0
+		local swings, misses, lastDist, lastMethod = 0, 0, nil, nil
 		for _ = 1, Cfg.thiefRounds do
 			for _ = 1, Cfg.thiefSwings do
 				local done, how = stopped(t)
@@ -4313,12 +4516,27 @@ function Thief.engage(token, t)
 					error("your character isn't ready (dead or respawning)", 0)
 				end
 				local tp = Util.position(t.model)
-				if tp and (P.root.Position - tp).Magnitude <= Cfg.thiefRange + 2 then
+				local dist = tp and (P.root.Position - tp).Magnitude or math.huge
+				if dist <= Cfg.thiefRange + 1 then
 					Actions.stop()
-					Actions.useTool(token, tsinelas, tp)
+					local hpBefore = t.humanoid.Health
+					local _, used = Actions.swing(token, tsinelas, tp, Thief.method)
 					swings = swings + 1
 					State.thief.swings = State.thief.swings + 1
+					lastDist, lastMethod = dist, used
 					Sched.wait(token, 0.45)
+					if Util.alive(t.humanoid) and t.humanoid.Health < hpBefore then
+						Thief.method = used -- remember the way of swinging that hurts thieves in this game
+						misses = 0
+					elseif not stopped(t) then
+						misses = misses + 1
+						if misses % 2 == 0 and Env.vim() then
+							-- Two misses in a row: try the other way of swinging.
+							Thief.method = (used == "click") and "activate" or "click"
+						end
+					end
+				else
+					lastDist = dist
 				end
 			end
 			if result then
@@ -4333,6 +4551,13 @@ function Thief.engage(token, t)
 				result = "escaped"
 			else
 				result = "still active after " .. swings .. " swing(s)"
+				if misses >= 2 then
+					Log.warn("Thief", string.format("Swings didn't hurt %s (last swing %.1f studs away, method %s). "
+						.. "If this keeps happening, use Settings → Export game scan while a thief is nearby and send the file.",
+						t.model.Name, lastDist or -1, tostring(lastMethod)))
+				elseif swings == 0 then
+					Log.warn("Thief", string.format("Couldn't get within swing distance of %s (closest %.1f studs).", t.model.Name, lastDist or -1))
+				end
 			end
 		end
 		if Cfg.thiefReturn and P.ready() then
@@ -4748,7 +4973,7 @@ function Clean.step(token, manual)
 			end
 		end
 	end, 20)
-	return 0.5
+	return Cfg.speed == "Fast" and 0.1 or 0.5 -- straight on to the next job in Fast speed
 end
 
 --==================================================================================
@@ -5710,16 +5935,18 @@ function UI.buildPages()
 	local cp = UI.page("Cashier Automation")
 	local k1 = featureHeader(cp, "cashier", "Cashier Automation",
 		"Rings up waiting customers at the register and handles the payment window the game opens. Each payment type has its own switch. A sale only counts once the game closes the window; anything it can't verify is left for you and shown here.")
-	UI.toggle(k1, "Auto Checkout", "Use the register when a customer is waiting.", "cashierEnabled")
+	UI.toggle(k1, "Auto Checkout", "Finishes every payment window the moment it opens: change counted and confirmed, KashG accepted or declined.", "cashierEnabled")
 	local stCash = UI.statusLine(k1, "cashier")
+	UI.toggle(k1, "Press E for me", "On: walks to the register and presses E when a customer waits. Off: you press E yourself and the mod finishes the payment instantly.", "cashierRingUp")
+	UI.toggle(k1, "Collect their utang first", "Before each customer's checkout, open the Utang Book and collect any debt that can be collected (only when 'Press E for me' is on).", "utangFirst")
 	local k2 = UI.card(cp, "Payment methods")
 	UI.toggle(k2, "Cash", "Count the exact change (sukli) with the fewest bills/coins, then Confirm.", "payCash")
 	UI.toggle(k2, "GCash (KashG)", "Accept KashG e-wallet payments (see the KashG check below).", "payKashG")
 	UI.toggle(k2, "Accept Utang", "Let customers who ask pay later (goes in the Utang Book).", "utangAccept")
 	UI.toggle(k2, "Decline Utang requests", "Turn this on to refuse every pay-later request.", "utangDecline")
 	local k3 = UI.card(cp, "KashG check")
-	UI.choice(k3, "Accept KashG when", "Verified only = the window must show a success word.", "kashgPolicy", { "Verified only", "Accept unless invalid", "Manual review" })
-	UI.toggle(k3, "Decline invalid KashG", "Decline payments whose window shows a failure word or a short amount.", "kashgDeclineInvalid")
+	UI.choice(k3, "Accept KashG when", "Accept unless fake = accept every payment that shows no sign of being fake. Verified only = the window must show a success word.", "kashgPolicy", { "Accept unless fake", "Verified only", "Manual review" })
+	UI.toggle(k3, "Decline fake KashG", "Decline payments whose window shows a failure word, a 'not confirmed'-style message, or a paid amount below the total.", "kashgDeclineInvalid")
 	UI.input(k3, "Success words", "Comma-separated; any of these in the KashG window counts as verified.", "successWords")
 	UI.input(k3, "Failure words", "Comma-separated; any of these marks the payment invalid.", "failWords")
 	local k4 = UI.card(cp, "Customers")
@@ -5772,7 +5999,7 @@ function UI.buildPages()
 	local stThief = UI.statusLine(t1, "thief")
 	UI.stepper(t1, "Swings per round", "", "thiefSwings", 1, 5, 1)
 	UI.stepper(t1, "Rounds", "Rounds of swings before giving up for 15 s.", "thiefRounds", 1, 5, 1)
-	UI.stepper(t1, "Swing distance", "", "thiefRange", 3, 12, 1, " studs")
+	UI.stepper(t1, "Swing distance", "How close to get before swinging (Tsinelas reach is short).", "thiefRange", 2, 10, 1, " studs")
 	UI.stepper(t1, "Watch radius", "How far from your store to look for thieves.", "thiefRadius", 40, 300, 10, " studs")
 	UI.toggle(t1, "Return afterwards", "Walk back to where you were.", "thiefReturn")
 	UI.input(t1, "Thief words", "An NPC counts as a thief when its name, an attribute or its overhead label contains one of these.", "thiefWords")
@@ -5863,7 +6090,8 @@ function UI.buildPages()
 			Log.warn("System", "Teleport movement is on. Only use it where the game owner allows it.")
 		end
 	end)
-	UI.stepper(g1, "Delay between clicks", "Human-like pause before each button press.", "actionDelay", 0.1, 2, 0.1, " s")
+	UI.choice(g1, "Speed", "Fast = buttons pressed and checked every frame (payments finish in about a second). Normal = the pause below between presses.", "speed", { "Fast", "Normal" })
+	UI.stepper(g1, "Delay between clicks (Normal)", "Pause before each button press in Normal speed.", "actionDelay", 0.1, 2, 0.1, " s")
 	UI.choice(g1, "Click method", "Auto = real (virtual) mouse clicks, so the game's own input checks apply; the game's button handlers are only used if your executor has no VirtualInputManager.", "clickMethod", { "Auto", "Virtual mouse", "Game signals" })
 	UI.toggle(g1, "Pause while I move", "Automation stops moving your character while you use WASD/Space.", "manualOverride")
 	UI.stepper(g1, "Pause length", "", "overrideSeconds", 1, 15, 1, " s")
@@ -6095,6 +6323,13 @@ function UI.exportScan()
 		local yes, why = Thief.classify(n.model)
 		L[#L + 1] = string.format("%s | %.0f studs | HP %d | attrs {%s} | thief: %s", Util.fullName(n.model), n.distance, math.floor(n.humanoid.Health), table.concat(attrs, ", "), yes and why or "no")
 	end
+	L[#L + 1] = ""
+	L[#L + 1] = "== KASHG WINDOWS SEEN THIS SESSION (newest first) =="
+	for _, k in ipairs(State.kashgSeen or {}) do
+		L[#L + 1] = k.time .. " [" .. k.verdict .. "] " .. k.text
+	end
+	L[#L + 1] = ""
+	L[#L + 1] = "== THIEF SWINGS == method that worked: " .. tostring(Thief.method or "not known yet")
 	L[#L + 1] = ""
 	L[#L + 1] = "== PLAYER ATTRIBUTES / LEADERSTATS =="
 	pcall(function()
